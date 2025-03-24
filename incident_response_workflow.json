@@ -1,0 +1,251 @@
+{
+    "name": "로그 이상 탐지 인시던트 대응 플레이북",
+    "description": "로그 이상 탐지 시스템에서 발견된 인시던트에 대한 자동화된 대응 플레이북",
+    "start": "인시던트 데이터 수신",
+    "nodes": [
+      {
+        "id": "인시던트 데이터 수신",
+        "type": "trigger",
+        "name": "인시던트 데이터 수신",
+        "description": "이상 탐지 시스템에서 인시던트 데이터 수신",
+        "next": [
+          "인시던트 심각도 평가"
+        ]
+      },
+      {
+        "id": "인시던트 심각도 평가",
+        "type": "condition",
+        "name": "인시던트 심각도 평가",
+        "description": "인시던트의 심각도 평가",
+        "conditions": [
+          {
+            "condition": {
+              "type": "equals",
+              "field1": "$.severity",
+              "field2": "critical"
+            },
+            "next": "긴급 알림 발송"
+          },
+          {
+            "condition": {
+              "type": "equals",
+              "field1": "$.severity",
+              "field2": "high"
+            },
+            "next": "일반 알림 발송"
+          },
+          {
+            "condition": {
+              "type": "default"
+            },
+            "next": "관련 로그 수집"
+          }
+        ]
+      },
+      {
+        "id": "긴급 알림 발송",
+        "type": "action",
+        "name": "긴급 알림 발송",
+        "description": "보안팀에 긴급 알림 발송",
+        "app_name": "Shuffle Tools",
+        "action_name": "Send SMS",
+        "parameters": {
+          "phone_numbers": ["YOUR_EMERGENCY_PHONE_NUMBER"],
+          "body": "긴급 보안 경고: {{ $.title }} - {{ $.description | truncate(100) }}"
+        },
+        "next": [
+          "관련 로그 수집"
+        ]
+      },
+      {
+        "id": "일반 알림 발송",
+        "type": "action",
+        "name": "일반 알림 발송",
+        "description": "보안팀에 일반 알림 발송",
+        "app_name": "Shuffle Tools",
+        "action_name": "Send Email",
+        "parameters": {
+          "to": "security-team@example.com",
+          "subject": "보안 경고: {{ $.title }}",
+          "body": "{{ $.description }}\n\n심각도: {{ $.severity }}\n탐지 시간: {{ $.timestamp }}"
+        },
+        "next": [
+          "관련 로그 수집"
+        ]
+      },
+      {
+        "id": "관련 로그 수집",
+        "type": "action",
+        "name": "관련 로그 수집",
+        "description": "인시던트와 관련된 로그 수집",
+        "app_name": "Elasticsearch",
+        "action_name": "Search",
+        "parameters": {
+          "url": "http://localhost:9200",
+          "index": "logs",
+          "query": {
+            "query": {
+              "bool": {
+                "must": [
+                  {
+                    "range": {
+                      "timestamp": {
+                        "gte": "{{ $.timestamp | date_modify('-30 minutes') | date('Y-m-d H:i:s') }}",
+                        "lte": "{{ $.timestamp | date_modify('+5 minutes') | date('Y-m-d H:i:s') }}"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "size": 100
+          }
+        },
+        "next": [
+          "관련 로그 분석"
+        ]
+      },
+      {
+        "id": "관련 로그 분석",
+        "type": "action",
+        "name": "관련 로그 분석",
+        "description": "수집된 로그를 분석하여 패턴 식별",
+        "app_name": "Python",
+        "action_name": "Execute Code",
+        "parameters": {
+          "code": "import json\nimport datetime\n\n# 입력 데이터 파싱\nworkflow_input = json.loads(execution_argument)\nlogs_response = json.loads(execution_argument.get('관련 로그 수집', {}).get('result', '{}'))\n\n# 인시던트 정보\ndetector_type = workflow_input.get('detector_type', 'unknown')\nincident_id = workflow_input.get('incident_id', 'unknown')\n\n# 로그 정보\nlogs = logs_response.get('hits', {}).get('hits', [])\nlog_data = [log.get('_source', {}) for log in logs]\n\n# 결과 딕셔너리\nresult = {\n    'log_count': len(log_data),\n    'incident_id': incident_id,\n    'detector_type': detector_type,\n    'patterns': []\n}\n\n# 탐지기 유형별 분석 로직\nif detector_type == 'isolation_forest':\n    # 로그 레벨별 집계\n    log_levels = {}\n    for log in log_data:\n        level = log.get('log_level', 'unknown')\n        log_levels[level] = log_levels.get(level, 0) + 1\n    \n    # 가장 많은 로그 레벨 식별\n    if log_levels:\n        most_common_level = max(log_levels, key=log_levels.get)\n        result['patterns'].append(f'가장 많은 로그 레벨: {most_common_level} ({log_levels[most_common_level]}개)')\n    \n    # 에러 메시지 패턴 식별\n    error_messages = []\n    for log in log_data:\n        if log.get('log_level') in ['ERROR', 'FATAL', 'CRITICAL']:\n            message = log.get('message', '')\n            if message:\n                error_messages.append(message)\n    \n    if error_messages:\n        result['patterns'].append(f'에러 메시지 {len(error_messages)}개 발견')\n        result['error_samples'] = error_messages[:3]  # 최대 3개 샘플\n\nelif detector_type == 'lstm':\n    # 시간 패턴 분석\n    timestamps = [log.get('timestamp') for log in log_data if 'timestamp' in log]\n    timestamps.sort()\n    \n    if len(timestamps) >= 2:\n        time_diffs = []\n        for i in range(1, len(timestamps)):\n            try:\n                t1 = datetime.datetime.strptime(timestamps[i-1], '%Y-%m-%d %H:%M:%S')\n                t2 = datetime.datetime.strptime(timestamps[i], '%Y-%m-%d %H:%M:%S')\n                diff_seconds = (t2 - t1).total_seconds()\n                time_diffs.append(diff_seconds)\n            except:\n                pass\n        \n        if time_diffs:\n            avg_diff = sum(time_diffs) / len(time_diffs)\n            result['patterns'].append(f'로그 간 평균 시간 간격: {avg_diff:.1f}초')\n\nelif detector_type == 'bert':\n    # 메시지 키워드 분석\n    keywords = {}\n    for log in log_data:\n        message = log.get('message', '').lower()\n        for word in ['error', 'exception', 'failed', 'timeout', 'denied', 'invalid']:\n            if word in message:\n                keywords[word] = keywords.get(word, 0) + 1\n    \n    if keywords:\n        for keyword, count in keywords.items():\n            if count > 0:\n                result['patterns'].append(f'키워드 \\\"{keyword}\\\": {count}개 발견')\n\n# 결과 반환\nreturn json.dumps(result)"
+        },
+        "next": [
+          "인시던트 티켓 생성"
+        ]
+      },
+      {
+        "id": "인시던트 티켓 생성",
+        "type": "action",
+        "name": "인시던트 티켓 생성",
+        "description": "ITSM 시스템에 인시던트 티켓 생성",
+        "app_name": "ServiceNow",
+        "action_name": "Create Incident",
+        "parameters": {
+          "url": "https://instance.service-now.com",
+          "username": "admin",
+          "password": "password",
+          "short_description": "{{ $.title }}",
+          "description": "{{ $.description }}\n\n분석 결과:\n{% for pattern in $.관련 로그 분석.patterns %}- {{ pattern }}\n{% endfor %}\n\n관련 로그 수: {{ $.관련 로그 분석.log_count }}개",
+          "urgency": "{% if $.severity == 'critical' %}1{% elif $.severity == 'high' %}2{% else %}3{% endif %}",
+          "category": "security"
+        },
+        "next": [
+          "대응 작업 결정"
+        ]
+      },
+      {
+        "id": "대응 작업 결정",
+        "type": "condition",
+        "name": "대응 작업 결정",
+        "description": "탐지된 인시던트에 대한 자동화된 대응 작업 결정",
+        "conditions": [
+          {
+            "condition": {
+              "type": "containsKey",
+              "field1": "$.anomaly_data.context.log_level_stats",
+              "field2": "ERROR"
+            },
+            "next": "로그 레벨 기반 대응"
+          },
+          {
+            "condition": {
+              "type": "containsKey",
+              "field1": "$.관련 로그 분석.error_samples",
+              "field2": ""
+            },
+            "next": "에러 메시지 기반 대응"
+          },
+          {
+            "condition": {
+              "type": "default"
+            },
+            "next": "기본 대응 조치"
+          }
+        ]
+      },
+      {
+        "id": "로그 레벨 기반 대응",
+        "type": "action",
+        "name": "로그 레벨 기반 대응",
+        "description": "로그 레벨에 기반한 자동화된 대응 수행",
+        "app_name": "Python",
+        "action_name": "Execute Code",
+        "parameters": {
+          "code": "import json\n\n# 로그 메시지 예제로 대체 (실제로는 관련 시스템에 API 요청 등을 수행)\nreturn json.dumps({\n    'action': 'log_level_based_response',\n    'completed': True,\n    'details': '대상 시스템 상태 확인 및 로그 패턴 분석 완료'\n})"
+        },
+        "next": [
+          "인시던트 업데이트"
+        ]
+      },
+      {
+        "id": "에러 메시지 기반 대응",
+        "type": "action",
+        "name": "에러 메시지 기반 대응",
+        "description": "에러 메시지 패턴에 기반한 자동화된 대응 수행",
+        "app_name": "Python",
+        "action_name": "Execute Code",
+        "parameters": {
+          "code": "import json\n\n# 실제 환경에서는 에러 메시지 패턴에 따라 다른 작업 수행\nreturn json.dumps({\n    'action': 'error_message_based_response',\n    'completed': True,\n    'details': '에러 메시지 분석 및 관련 서비스 상태 점검 완료'\n})"
+        },
+        "next": [
+          "인시던트 업데이트"
+        ]
+      },
+      {
+        "id": "기본 대응 조치",
+        "type": "action",
+        "name": "기본 대응 조치",
+        "description": "기본적인 대응 조치 수행",
+        "app_name": "Python",
+        "action_name": "Execute Code",
+        "parameters": {
+          "code": "import json\n\n# 기본 대응 조치 예제 (실제로는 환경에 맞게 구현)\nreturn json.dumps({\n    'action': 'default_response',\n    'completed': True,\n    'details': '기본 모니터링 및 로그 수집 강화'\n})"
+        },
+        "next": [
+          "인시던트 업데이트"
+        ]
+      },
+      {
+        "id": "인시던트 업데이트",
+        "type": "action",
+        "name": "인시던트 업데이트",
+        "description": "Elasticsearch에 인시던트 상태 업데이트",
+        "app_name": "Elasticsearch",
+        "action_name": "Update",
+        "parameters": {
+          "url": "http://localhost:9200",
+          "index": "security-incidents",
+          "id": "{{ $.incident_id }}",
+          "body": {
+            "doc": {
+              "status": "responded",
+              "updated_at": "{{ 'now' | date('Y-m-d H:i:s') }}",
+              "actions": [
+                {
+                  "action_type": "automated_response",
+                  "description": "자동화된 대응 수행 완료",
+                  "status": "completed",
+                  "timestamp": "{{ 'now' | date('Y-m-d H:i:s') }}"
+                }
+              ]
+            }
+          }
+        },
+        "next": [
+          "워크플로우 완료"
+        ]
+      },
+      {
+        "id": "워크플로우 완료",
+        "type": "end",
+        "name": "워크플로우 완료",
+        "description": "인시던트 대응 워크플로우 완료"
+      }
+    ]
+  }
